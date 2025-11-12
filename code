@@ -1,0 +1,212 @@
+// === Insize liste sayfası (await'li, stabil):
+// - Ürün kartını "Code:" yazısından bulur → klasör adı
+// - Kart içindeki /upfiles/ görselleri alır (lazy-load alanlarını destekler)
+// - Karttaki /page-*.html detayına gider → iframe'den gerçek PDF'i çıkarır
+// - Tüm indirmeleri await eder → sonra ZIP'i indirir (CORS PDF'ler tek tek indirilir)
+(async () => {
+  const loadScript = src => new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src;
+    s.onload = res; s.onerror = () => rej(new Error('Script yüklenemedi: ' + src));
+    document.head.appendChild(s);
+  });
+  const safe = s => (s||'').toString().replace(/[:*?"<>|\\/\u0000-\u001F]/g,'_').replace(/\s+/g,' ').trim().slice(0,150)||'unknown';
+  const abs  = (u, b=location.href) => { try { return new URL(u, b).toString(); } catch { return null; } };
+  const pOf  = u => { try { return new URL(u).pathname; } catch { return ''; } };
+  const isUp = u => /\/upfiles\//i.test(pOf(u));
+  const firstFromSrcset = ss => ss ? ss.split(',')[0].trim().split(/\s+/)[0] : null;
+  const sameSite = urlStr => {
+    try {
+      const a = new URL(urlStr), b = new URL(location.href);
+      if (a.origin === b.origin) return true;
+      const strip = h => h.replace(/^www\./i,'');
+      return a.protocol === b.protocol && strip(a.host) === strip(b.host);
+    } catch { return false; }
+  };
+  const reCodeLine = /code\s*[:：]\s*([^\n\r<]+)/i;
+  const codeFromText = (txt) => {
+    const m = txt.match(reCodeLine);
+    if (!m) return null;
+    let raw = m[1].trim();
+    raw = raw.replace(/\bseries\b/i, '').trim();
+    raw = raw.split(/[\/\s]/)[0];
+    raw = raw.replace(/[^A-Za-z0-9._-]/g, '');
+    return safe(raw) || null;
+  };
+  const findCard = (el) =>
+    el.closest('.pro_list li, li, article, section, .product, .item, .pro, .box, .row') || el.closest('div') || el;
+
+  const realPdfFrom = (raw, base) => {
+    const u = abs(raw, base); if (!u) return null;
+    try {
+      const x = new URL(u);
+      if (/\/pdf\/web/i.test(x.pathname)) {
+        const fp = x.searchParams.get('file') || x.searchParams.get('src');
+        const r  = abs(fp, u);
+        if (r && /\.pdf(\?|#|$)/i.test(r)) return r;
+      }
+      if (/\.pdf(\?|#|$)/i.test(u)) return u;
+      return u;
+    } catch { return u; }
+  };
+
+  const findPdfOnDetail = async (detailUrl) => {
+    try {
+      const r = await fetch(detailUrl, {credentials:'include'});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const html = await r.text();
+      const doc  = new DOMParser().parseFromString(html, 'text/html');
+      const ifr = doc.querySelector('iframe[src]');
+      if (ifr) {
+        const pdf = realPdfFrom(ifr.getAttribute('src'), detailUrl);
+        if (pdf && /\.pdf(\?|#|$)/i.test(pdf) && isUp(pdf)) return pdf;
+      }
+      const a = doc.querySelector('a[href*=".pdf"]');
+      if (a) {
+        const pdf = realPdfFrom(a.getAttribute('href'), detailUrl);
+        if (pdf && /\.pdf(\?|#|$)/i.test(pdf) && isUp(pdf)) return pdf;
+      }
+      const emb = doc.querySelector('embed[src*=".pdf"]');
+      if (emb) {
+        const pdf = realPdfFrom(emb.getAttribute('src'), detailUrl);
+        if (pdf && /\.pdf(\?|#|$)/i.test(pdf) && isUp(pdf)) return pdf;
+      }
+      const obj = doc.querySelector('object[data*=".pdf"]');
+      if (obj) {
+        const pdf = realPdfFrom(obj.getAttribute('data'), detailUrl);
+        if (pdf && /\.pdf(\?|#|$)/i.test(pdf) && isUp(pdf)) return pdf;
+      }
+      return null;
+    } catch (e) {
+      console.warn('Detay sayfa alınamadı:', detailUrl, e && e.message);
+      return null;
+    }
+  };
+
+  const fnameFromUrl = (u, stem, idx) => {
+    try {
+      const x = new URL(u);
+      let fn = decodeURIComponent(x.pathname.split('/').pop() || '');
+      if (!fn) fn = `${stem}-${idx}`;
+      if (!/\.[A-Za-z0-9]{2,5}(\?|#|$)/.test(fn)) fn += /\.pdf(\?|#|$)/i.test(u) ? '.pdf' : '.jpg';
+      return safe(fn);
+    } catch { return `${stem}-${idx}.bin`; }
+  };
+
+  await loadScript('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js');
+  const zip = new JSZip();
+
+  // 1) Ürün kartlarını topla (Code yazısından)
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+  const products = []; // {code, card}
+  const seenCards = new Set();
+  while (walker.nextNode()) {
+    const t = walker.currentNode.nodeValue || '';
+    if (/code\s*[:：]/i.test(t)) {
+      const el = walker.currentNode.parentElement || walker.currentNode;
+      const card = findCard(el);
+      if (seenCards.has(card)) continue;
+      const code = codeFromText(card.innerText || '');
+      if (code) { products.push({code, card}); seenCards.add(card); }
+    }
+  }
+  console.log('Bulunan ürün kartı:', products.length);
+  if (!products.length) return;
+
+  // 2) Tüm indirmeleri promise listesine koy → hepsini bekle
+  const tasks = [];
+  const pdfFallback = []; // CORS PDF için direkt indirme
+  let added = 0, skipped = 0, failed = 0;
+
+  for (const {code, card} of products) {
+    const folder = zip.folder(code);
+    let idx = 0;
+
+    // IMG (await'li)
+    const imgs = card.querySelectorAll('img[src], img[data-src], img[data-original]');
+    for (const img of imgs) {
+      const s1 = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original');
+      const s2 = img.getAttribute('srcset') || img.getAttribute('data-srcset');
+      const u0 = s1 || firstFromSrcset(s2);
+      const u  = abs(u0);
+      if (!u || !isUp(u)) continue;
+      const r  = img.getBoundingClientRect?.() || {width:0,height:0};
+      if (r.width < 100 || r.height < 100) continue;
+
+      const fname = fnameFromUrl(u, 'image-'+(++idx), idx);
+      tasks.push((async () => {
+        if (!sameSite(u)) { skipped++; return; }
+        try {
+          const res = await fetch(u, {credentials:'include'});
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const buf = await res.arrayBuffer();
+          folder.file(fname, buf);
+          added++;
+        } catch (e) { failed++; console.warn('IMG indirilemedi:', u, e.message); }
+      })());
+    }
+
+    // Detay linki → PDF
+    const detailLink = (() => {
+      const cand = card.querySelectorAll('a[href], iframe[src]');
+      for (const a of cand) {
+        const v = a.getAttribute(a.tagName.toLowerCase()==='a' ? 'href' : 'src') || '';
+        if (/\/page-\d+(?:-\d+)?\.html/i.test(v)) return abs(v);
+      }
+      return null;
+    })();
+
+    if (detailLink) {
+      tasks.push((async () => {
+        const pdfUrl = await findPdfOnDetail(detailLink);
+        if (!pdfUrl) return;
+        const fname = fnameFromUrl(pdfUrl, 'file-'+(++idx), idx);
+        if (sameSite(pdfUrl)) {
+          try {
+            const r = await fetch(pdfUrl, {credentials:'include'});
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const buf = await r.arrayBuffer();
+            folder.file(fname, buf);
+            added++;
+          } catch (e) {
+            pdfFallback.push({url: pdfUrl, name: `${code}-${fname}`});
+            console.warn('PDF fetch olmadı, fallback indirme:', pdfUrl);
+          }
+        } else {
+          pdfFallback.push({url: pdfUrl, name: `${code}-${fname}`});
+          console.warn('CORS (PDF) -> fallback indirme:', pdfUrl);
+        }
+      })());
+    }
+  }
+
+  // Tüm indirmeleri bekle
+  await Promise.allSettled(tasks);
+
+// 3) ZIP indir (varsa)
+if (added > 0) {
+  const zipName = "Insize.com-Scraper İsa.zip";  // <-- burası değişti
+  const blob = await zip.generateAsync({type:'blob'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); 
+  a.download = zipName;
+  document.body.appendChild(a); 
+  a.click();
+  URL.revokeObjectURL(a.href); 
+  a.remove();
+  console.log(`ZIP hazır → ${zipName} | ZIP'e eklenen:${added}, atlanan(CORS):${skipped}, hata:${failed}`);
+} else {
+  console.log('ZIP oluşturulmadı (muhtemelen tümü CORS ya da detaylarda PDF yok).');
+}
+
+  // 4) PDF fallback (CORS) → tarayıcı indirmesi
+  if (pdfFallback.length) {
+    const a = document.createElement('a');
+    document.body.appendChild(a);
+    for (const {url, name} of pdfFallback) {
+      a.href = url; a.download = name; a.click();
+      await new Promise(r => setTimeout(r,0));
+    }
+    a.remove();
+    console.log(`PDF fallback indirmeleri başlatıldı: ${pdfFallback.length} dosya`);
+  }
+})();
